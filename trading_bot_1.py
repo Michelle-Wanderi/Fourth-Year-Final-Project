@@ -39,6 +39,7 @@ CONFIG = {
     "wf_test_size":   120,           # days per walk-forward fold
     "wf_step_size":   120,           # step between folds
     "paper_trading_mode": False,     # set True to run paper trading cycle
+    "paper_quick_mode": True,        # if True, skip full backtest/report when paper trading
     "paper_state_file": "paper_state.json",
     "paper_trade_log": "paper_trades.csv",
     "features": [
@@ -597,6 +598,12 @@ def main():
             # 3. Train RF
             rf, scaler, test_rf = train_random_forest(df, short)
 
+        if CONFIG["paper_trading_mode"]:
+            paper_trade_cycle(df, symbol, rf, scaler)
+            if CONFIG["paper_quick_mode"]:
+                print("  [PAPER] Quick mode enabled: skipping full backtest/report.")
+                continue
+
         # 4. MA baseline
         if CONFIG["use_walk_forward"]:
             test_ma = test_rf.copy()
@@ -609,9 +616,6 @@ def main():
         res_ma = backtest(test_ma, f"{short} — MA Crossover")
         res_bh = buy_and_hold_benchmark(test_rf, f"{short} — Buy & Hold")
         all_results.extend([res_rf, res_ma, res_bh])
-
-        if CONFIG["paper_trading_mode"]:
-            paper_trade_cycle(df, symbol, rf, scaler)
 
         # Print quick summary
         print(f"\n  [RF] Return={res_rf['total_return']:+.2f}%  "
@@ -627,11 +631,14 @@ def main():
               f"CAGR={res_bh['cagr']:.2f}%  "
               f"Sharpe={res_bh['sharpe']:.3f}")
 
-    # 6. Report
-    print(f"\n{'-'*60}")
-    print("  GENERATING PERFORMANCE REPORT ...")
-    generate_report(all_results, dfs)
-    print("\n[OK] Pipeline complete.")
+    if all_results:
+        # 6. Report
+        print(f"\n{'-'*60}")
+        print("  GENERATING PERFORMANCE REPORT ...")
+        generate_report(all_results, dfs)
+        print("\n[OK] Pipeline complete.")
+    else:
+        print("\n[OK] Paper trading cycle complete.")
 
 
 if __name__ == "__main__":
