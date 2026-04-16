@@ -1,6 +1,13 @@
 #!/usr/bin/env python3
 """
+<<<<<<< HEAD
 ML-Driven Cryptocurrency Trading Bot
+=======
+
+Run:
+    pip install yfinance pandas pandas-ta scikit-learn backtrader matplotlib seaborn
+    python trading_bot.py
+>>>>>>> 323557ce4ae9bdb9d0fa29eef7aa4ea2bf6ac271
 """
 
 import numpy as np
