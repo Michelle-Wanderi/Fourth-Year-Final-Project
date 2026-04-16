@@ -1,12 +1,6 @@
 #!/usr/bin/env python3
 """
 ML-Driven Cryptocurrency Trading Bot
-Author: Michelle Wangari Wanderi | SCT213-C002-0108/2022
-JKUAT — BSc Data Science Final Year Project
-
-Run:
-    pip install yfinance pandas pandas-ta scikit-learn backtrader matplotlib seaborn
-    python trading_bot.py
 """
 
 import numpy as np
@@ -63,7 +57,7 @@ def collect_data(symbol: str) -> pd.DataFrame:
     Fetch historical OHLCV data from Yahoo Finance (Binance API alternative).
     Uses yfinance — no API key required.
     """
-    print(f"  Downloading {symbol} data ({CONFIG['start_date']} → {CONFIG['end_date']})...")
+    print(f"  Downloading {symbol} data ({CONFIG['start_date']} -> {CONFIG['end_date']})...")
     df = yf.download(
         symbol,
         start=CONFIG["start_date"],
@@ -80,7 +74,7 @@ def collect_data(symbol: str) -> pd.DataFrame:
     
     df = df[["Open", "High", "Low", "Close", "Volume"]].copy()
     df.dropna(inplace=True)
-    print(f"  ✓ {symbol}: {len(df)} trading days | "
+    print(f"  [OK] {symbol}: {len(df)} trading days | "
           f"${df['Close'].min():.0f} – ${df['Close'].max():.0f}")
     return df
 
@@ -149,8 +143,8 @@ def train_random_forest(df: pd.DataFrame, symbol: str):
     split    = int(len(df) * CONFIG["train_ratio"])
     train, test = df.iloc[:split].copy(), df.iloc[split:].copy()
 
-    print(f"\n  Train: {train.index[0].date()} → {train.index[-1].date()} ({len(train)} days)")
-    print(f"  Test:  {test.index[0].date()}  → {test.index[-1].date()}  ({len(test)} days)")
+    print(f"\n  Train: {train.index[0].date()} -> {train.index[-1].date()} ({len(train)} days)")
+    print(f"  Test:  {test.index[0].date()}  -> {test.index[-1].date()}  ({len(test)} days)")
 
     # Min-Max normalisation (no lookahead — fit on train only)
     scaler    = MinMaxScaler()
@@ -167,7 +161,7 @@ def train_random_forest(df: pd.DataFrame, symbol: str):
     test["signal"] = preds
 
     acc = accuracy_score(test["target"], preds)
-    print(f"\n  ── Random Forest: {symbol} ──")
+    print(f"\n  -- Random Forest: {symbol} --")
     print(f"  Accuracy: {acc:.4f}")
     print(classification_report(test["target"], preds,
                                 target_names=["Hold/Sell", "Buy"], digits=3))
@@ -176,7 +170,7 @@ def train_random_forest(df: pd.DataFrame, symbol: str):
     importances = pd.Series(rf.feature_importances_, index=features).sort_values(ascending=False)
     print("  Feature importances:")
     for feat, imp in importances.items():
-        bar = "█" * int(imp * 50)
+        bar = "#" * int(imp * 50)
         print(f"    {feat:15s} {bar} {imp:.4f}")
 
     return rf, scaler, test
@@ -414,7 +408,7 @@ def generate_report(results: list, dfs: dict):
              ha="center", fontsize=18, fontweight="bold",
              color=GOLD, fontfamily="monospace")
     fig.text(0.5, 0.948,
-             "Random Forest vs MA Crossover  ·  Michelle Wangari Wanderi  ·  JKUAT",
+             "ML-Driven Cryptocurrency Trading Bot",
              ha="center", fontsize=10, color=GREY, fontfamily="monospace")
 
     rf_btc = next(r for r in results if "BTC" in r["label"] and "Forest" in r["label"])
@@ -478,7 +472,7 @@ def generate_report(results: list, dfs: dict):
     out = "backtest_report.png"
     plt.savefig(out, dpi=150, bbox_inches="tight",
                 facecolor=BG, edgecolor="none")
-    print(f"\n  ✓ Report saved → {out}")
+    print(f"\n  [OK] Report saved -> {out}")
     plt.close()
 
 
@@ -565,7 +559,7 @@ def paper_trade_cycle(df: pd.DataFrame, symbol: str, model, scaler):
 # ═══════════════════════════════════════════════════════
 def main():
     print("=" * 60)
-    print("  ML CRYPTO TRADING BOT — RBI Pipeline")
+    print("  ML-DRIVEN CRYPTOCURRENCY TRADING BOT")
     print(f"  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print("=" * 60)
 
@@ -574,9 +568,9 @@ def main():
 
     for symbol in CONFIG["symbols"]:
         short = symbol.split("-")[0]
-        print(f"\n{'─'*60}")
+        print(f"\n{'-'*60}")
         print(f"  PROCESSING: {symbol}")
-        print(f"{'─'*60}")
+        print(f"{'-'*60}")
 
         # 1. Collect
         df_raw = collect_data(symbol)
@@ -620,12 +614,12 @@ def main():
             paper_trade_cycle(df, symbol, rf, scaler)
 
         # Print quick summary
-        print(f"\n  ┌─ RF  : Return={res_rf['total_return']:+.2f}%  "
+        print(f"\n  [RF] Return={res_rf['total_return']:+.2f}%  "
               f"Sharpe={res_rf['sharpe']:.3f}  "
               f"Sortino={res_rf['sortino']:.3f}  "
               f"MaxDD={res_rf['max_drawdown']:.2f}%  "
               f"Win={res_rf['win_rate']:.1f}%  Trades={res_rf['n_trades']}")
-        print(f"  └─ MA  : Return={res_ma['total_return']:+.2f}%  "
+        print(f"  [MA] Return={res_ma['total_return']:+.2f}%  "
               f"Sharpe={res_ma['sharpe']:.3f}  "
               f"MaxDD={res_ma['max_drawdown']:.2f}%  "
               f"Win={res_ma['win_rate']:.1f}%  Trades={res_ma['n_trades']}")
@@ -634,10 +628,10 @@ def main():
               f"Sharpe={res_bh['sharpe']:.3f}")
 
     # 6. Report
-    print(f"\n{'─'*60}")
+    print(f"\n{'-'*60}")
     print("  GENERATING PERFORMANCE REPORT ...")
     generate_report(all_results, dfs)
-    print("\n✅ Pipeline complete.")
+    print("\n[OK] Pipeline complete.")
 
 
 if __name__ == "__main__":
