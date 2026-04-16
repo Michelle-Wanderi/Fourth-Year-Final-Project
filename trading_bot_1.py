@@ -17,6 +17,7 @@ import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 import warnings
 import os
+import json
 from datetime import datetime
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import classification_report, accuracy_score
@@ -35,8 +36,17 @@ CONFIG = {
     "initial_capital": 10_000,       # USD
     "position_size":  0.10,          # 10% of capital per trade
     "stop_loss":      0.03,          # 3% stop-loss per trade
+    "transaction_cost": 0.001,       # 0.1% per side
+    "slippage":       0.0005,        # 0.05% adverse fill assumption
     "n_estimators":   100,           # Random Forest trees
     "random_state":   42,
+    "use_walk_forward": True,        # robust validation over single split
+    "wf_train_size":  700,           # initial train days
+    "wf_test_size":   120,           # days per walk-forward fold
+    "wf_step_size":   120,           # step between folds
+    "paper_trading_mode": False,     # set True to run paper trading cycle
+    "paper_state_file": "paper_state.json",
+    "paper_trade_log": "paper_trades.csv",
     "features": [
         "RSI_14", "MACD", "MACD_signal",
         "SMA_20", "SMA_50",
@@ -172,6 +182,62 @@ def train_random_forest(df: pd.DataFrame, symbol: str):
     return rf, scaler, test
 
 
+def walk_forward_random_forest(df: pd.DataFrame, symbol: str):
+    """
+    Expanding-window walk-forward evaluation.
+    Returns: (predictions_df, fold_summaries)
+    """
+    features = CONFIG["features"]
+    train_size = CONFIG["wf_train_size"]
+    test_size = CONFIG["wf_test_size"]
+    step = CONFIG["wf_step_size"]
+
+    if len(df) < (train_size + test_size):
+        print("  [WF] Not enough rows, falling back to single split.")
+        _, _, test = train_random_forest(df, symbol)
+        return test, []
+
+    fold_predictions = []
+    fold_summaries = []
+    fold = 1
+
+    for start in range(train_size, len(df) - test_size + 1, step):
+        train = df.iloc[:start].copy()
+        test = df.iloc[start:start + test_size].copy()
+
+        scaler = MinMaxScaler()
+        X_train_s = scaler.fit_transform(train[features])
+        X_test_s = scaler.transform(test[features])
+
+        rf = RandomForestClassifier(
+            n_estimators=CONFIG["n_estimators"],
+            random_state=CONFIG["random_state"],
+            n_jobs=-1
+        )
+        rf.fit(X_train_s, train["target"])
+        preds = rf.predict(X_test_s)
+        test["signal"] = preds
+        test["wf_fold"] = fold
+        fold_predictions.append(test)
+
+        acc = accuracy_score(test["target"], preds)
+        fold_summaries.append({
+            "fold": fold,
+            "train_rows": len(train),
+            "test_rows": len(test),
+            "acc": acc,
+            "start": str(test.index[0].date()),
+            "end": str(test.index[-1].date()),
+        })
+        print(f"  [WF] Fold {fold:02d}: {test.index[0].date()} -> "
+              f"{test.index[-1].date()} | Acc={acc:.4f}")
+        fold += 1
+
+    combined = pd.concat(fold_predictions).sort_index()
+    combined = combined[~combined.index.duplicated(keep="last")]
+    return combined, fold_summaries
+
+
 # ═══════════════════════════════════════════════════════
 #  BASELINE — MOVING AVERAGE CROSSOVER (SMA 20/50)
 # ═══════════════════════════════════════════════════════
@@ -184,6 +250,66 @@ def moving_average_baseline(df: pd.DataFrame) -> pd.DataFrame:
     test = df.iloc[int(len(df) * CONFIG["train_ratio"]):].copy()
     test["signal"] = (test["SMA_20"] > test["SMA_50"]).astype(int)
     return test
+
+
+def buy_and_hold_benchmark(test: pd.DataFrame, label: str) -> dict:
+    """
+    Buy-and-hold benchmark over same test window.
+    """
+    if test.empty:
+        raise ValueError("Benchmark received empty test data.")
+    start_price = float(test["Close"].iloc[0])
+    qty = CONFIG["initial_capital"] / start_price
+    equity = qty * test["Close"]
+    return compute_metrics(equity, [], label)
+
+
+def compute_metrics(equity_s: pd.Series, trades: list, label: str) -> dict:
+    """
+    Compute return and risk metrics from an equity curve.
+    """
+    final_capital = float(equity_s.iloc[-1])
+    total_return = (final_capital - CONFIG["initial_capital"]) / CONFIG["initial_capital"] * 100
+    daily_ret = equity_s.pct_change().dropna()
+    sharpe = (daily_ret.mean() / daily_ret.std() * np.sqrt(252)
+              if daily_ret.std() > 0 else 0.0)
+
+    downside = daily_ret[daily_ret < 0]
+    sortino = (daily_ret.mean() / downside.std() * np.sqrt(252)
+               if len(downside) > 1 and downside.std() > 0 else 0.0)
+
+    roll_max = equity_s.cummax()
+    max_dd = ((equity_s - roll_max) / roll_max).min() * 100
+
+    years = max((equity_s.index[-1] - equity_s.index[0]).days / 365.25, 1 / 365.25)
+    cagr = ((final_capital / CONFIG["initial_capital"]) ** (1 / years) - 1) * 100
+    calmar = (cagr / abs(max_dd)) if max_dd < 0 else 0.0
+
+    completed = [t for t in trades if t.get("type") in ("SELL", "STOP-LOSS")]
+    wins = [t for t in completed if t["pnl"] > 0]
+    losses = [t for t in completed if t["pnl"] <= 0]
+    win_rate = len(wins) / len(completed) * 100 if completed else 0.0
+    gross_profit = sum(t["pnl"] for t in wins)
+    gross_loss = abs(sum(t["pnl"] for t in losses))
+    profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else np.nan
+    expectancy = (sum(t["pnl"] for t in completed) / len(completed)) if completed else 0.0
+
+    return {
+        "label": label,
+        "final_capital": final_capital,
+        "total_return": total_return,
+        "cagr": cagr,
+        "sharpe": sharpe,
+        "sortino": sortino,
+        "calmar": calmar,
+        "max_drawdown": max_dd,
+        "win_rate": win_rate,
+        "profit_factor": profit_factor,
+        "expectancy": expectancy,
+        "n_trades": len(completed),
+        "equity": equity_s,
+        "trades": pd.DataFrame(trades),
+    }
 
 
 # ═══════════════════════════════════════════════════════
@@ -207,32 +333,37 @@ def backtest(test: pd.DataFrame, label: str) -> dict:
     for date, row in test.iterrows():
         price = float(row["Close"])
         sig   = int(row["signal"])
+        fee = CONFIG["transaction_cost"]
+        slip = CONFIG["slippage"]
 
         # ── Stop-loss check ─────────────────────────────
         if position > 0 and price < entry_price * (1 - CONFIG["stop_loss"]):
-            proceeds = position * price * (1 - 0.001)  # 0.1% fee
+            stop_fill = price * (1 - slip)  # adverse fill for sell
+            proceeds = position * stop_fill * (1 - fee)
             pnl      = proceeds - (position * entry_price)
             capital += proceeds
             trades.append({"date": date, "type": "STOP-LOSS",
-                           "price": price, "pnl": pnl})
+                           "price": stop_fill, "pnl": pnl})
             position = 0.0
 
         # ── Buy ─────────────────────────────────────────
         if sig == 1 and position == 0:
             invest   = capital * CONFIG["position_size"]
-            position = (invest * (1 - 0.001)) / price  # fee on entry
+            buy_fill = price * (1 + slip)  # adverse fill for buy
+            position = (invest * (1 - fee)) / buy_fill
             capital -= invest
-            entry_price = price
+            entry_price = buy_fill
             trades.append({"date": date, "type": "BUY",
-                           "price": price, "pnl": 0})
+                           "price": buy_fill, "pnl": 0})
 
         # ── Sell ────────────────────────────────────────
         elif sig == 0 and position > 0:
-            proceeds = position * price * (1 - 0.001)
+            sell_fill = price * (1 - slip)
+            proceeds = position * sell_fill * (1 - fee)
             pnl      = proceeds - (position * entry_price)
             capital += proceeds
             trades.append({"date": date, "type": "SELL",
-                           "price": price, "pnl": pnl})
+                           "price": sell_fill, "pnl": pnl})
             position = 0.0
 
         equity.append(capital + position * price)
@@ -240,36 +371,12 @@ def backtest(test: pd.DataFrame, label: str) -> dict:
     # Close any remaining position at last price
     if position > 0:
         last_price = float(test["Close"].iloc[-1])
-        capital   += position * last_price * (1 - 0.001)
+        sell_fill = last_price * (1 - CONFIG["slippage"])
+        capital   += position * sell_fill * (1 - CONFIG["transaction_cost"])
         equity[-1] = capital
 
     equity_s = pd.Series(equity, index=test.index)
-
-    # ── Metrics ─────────────────────────────────────────
-    total_return = (capital - CONFIG["initial_capital"]) / CONFIG["initial_capital"] * 100
-
-    daily_ret = equity_s.pct_change().dropna()
-    sharpe    = (daily_ret.mean() / daily_ret.std() * np.sqrt(252)
-                 if daily_ret.std() > 0 else 0.0)
-
-    roll_max   = equity_s.cummax()
-    max_dd     = ((equity_s - roll_max) / roll_max).min() * 100
-
-    completed  = [t for t in trades if t["type"] in ("SELL", "STOP-LOSS")]
-    wins       = [t for t in completed if t["pnl"] > 0]
-    win_rate   = len(wins) / len(completed) * 100 if completed else 0.0
-
-    return {
-        "label":         label,
-        "final_capital": capital,
-        "total_return":  total_return,
-        "sharpe":        sharpe,
-        "max_drawdown":  max_dd,
-        "win_rate":      win_rate,
-        "n_trades":      len(completed),
-        "equity":        equity_s,
-        "trades":        pd.DataFrame(trades),
-    }
+    return compute_metrics(equity_s, trades, label)
 
 
 # ═══════════════════════════════════════════════════════
@@ -347,12 +454,14 @@ def generate_report(results: list, dfs: dict):
 
     ax_t = fig.add_subplot(gs[2, :])
     ax_t.axis("off")
-    cols = ["Strategy", "Return %", "Sharpe", "Max DD %", "Win Rate %", "Trades"]
+    cols = ["Strategy", "Return %", "CAGR %", "Sharpe", "Sortino", "Max DD %", "ProfitFactor", "Trades"]
     rows = [[r["label"],
              f'{r["total_return"]:.2f}%',
+             f'{r["cagr"]:.2f}%',
              f'{r["sharpe"]:.3f}',
+             f'{r["sortino"]:.3f}',
              f'{r["max_drawdown"]:.2f}%',
-             f'{r["win_rate"]:.1f}%',
+             f'{r["profit_factor"]:.2f}' if pd.notna(r["profit_factor"]) else "N/A",
              str(r["n_trades"])] for r in results]
     tbl  = ax_t.table(cellText=rows, colLabels=cols,
                        loc="center", cellLoc="center")
@@ -371,6 +480,84 @@ def generate_report(results: list, dfs: dict):
                 facecolor=BG, edgecolor="none")
     print(f"\n  ✓ Report saved → {out}")
     plt.close()
+
+
+def _load_paper_state() -> dict:
+    if os.path.exists(CONFIG["paper_state_file"]):
+        with open(CONFIG["paper_state_file"], "r", encoding="utf-8") as f:
+            return json.load(f)
+    return {
+        "cash": CONFIG["initial_capital"],
+        "positions": {},
+        "updated_at": datetime.utcnow().isoformat(),
+    }
+
+
+def _save_paper_state(state: dict):
+    state["updated_at"] = datetime.utcnow().isoformat()
+    with open(CONFIG["paper_state_file"], "w", encoding="utf-8") as f:
+        json.dump(state, f, indent=2)
+
+
+def _append_paper_trade(row: dict):
+    df = pd.DataFrame([row])
+    if os.path.exists(CONFIG["paper_trade_log"]):
+        df.to_csv(CONFIG["paper_trade_log"], mode="a", header=False, index=False)
+    else:
+        df.to_csv(CONFIG["paper_trade_log"], index=False)
+
+
+def paper_trade_cycle(df: pd.DataFrame, symbol: str, model, scaler):
+    """
+    One paper-trade cycle based on latest signal.
+    Schedule this script daily/periodically when paper_trading_mode=True.
+    """
+    state = _load_paper_state()
+    short = symbol.split("-")[0]
+    latest = df.iloc[-1]
+    features = CONFIG["features"]
+    X = scaler.transform(df[features].iloc[[-1]])
+    signal = int(model.predict(X)[0])
+    price = float(latest["Close"])
+    fee = CONFIG["transaction_cost"]
+    slip = CONFIG["slippage"]
+
+    pos = state["positions"].get(short, {"qty": 0.0, "entry_price": 0.0})
+    qty = float(pos["qty"])
+
+    action = "HOLD"
+    if signal == 1 and qty == 0:
+        invest = float(state["cash"]) * CONFIG["position_size"]
+        buy_fill = price * (1 + slip)
+        qty = (invest * (1 - fee)) / buy_fill
+        state["cash"] -= invest
+        state["positions"][short] = {"qty": qty, "entry_price": buy_fill}
+        action = "BUY"
+        _append_paper_trade({
+            "timestamp": datetime.utcnow().isoformat(),
+            "symbol": symbol,
+            "action": action,
+            "price": buy_fill,
+            "qty": qty,
+            "cash_after": state["cash"],
+        })
+    elif signal == 0 and qty > 0:
+        sell_fill = price * (1 - slip)
+        proceeds = qty * sell_fill * (1 - fee)
+        state["cash"] += proceeds
+        state["positions"][short] = {"qty": 0.0, "entry_price": 0.0}
+        action = "SELL"
+        _append_paper_trade({
+            "timestamp": datetime.utcnow().isoformat(),
+            "symbol": symbol,
+            "action": action,
+            "price": sell_fill,
+            "qty": qty,
+            "cash_after": state["cash"],
+        })
+
+    _save_paper_state(state)
+    print(f"  [PAPER] {symbol}: signal={signal} action={action} close={price:.2f}")
 
 
 # ═══════════════════════════════════════════════════════
@@ -398,26 +585,53 @@ def main():
         df = engineer_features(df_raw)
         dfs[short] = df
 
-        # 3. Train RF
-        rf, scaler, test_rf = train_random_forest(df, short)
+        if CONFIG["use_walk_forward"]:
+            print("\n  Running walk-forward validation...")
+            test_rf, wf_folds = walk_forward_random_forest(df, short)
+            print(f"  [WF] Total folds: {len(wf_folds)}")
+
+            # train final model on full history for paper-trading predictions
+            scaler = MinMaxScaler()
+            X_all = scaler.fit_transform(df[CONFIG["features"]])
+            rf = RandomForestClassifier(
+                n_estimators=CONFIG["n_estimators"],
+                random_state=CONFIG["random_state"],
+                n_jobs=-1
+            )
+            rf.fit(X_all, df["target"])
+        else:
+            # 3. Train RF
+            rf, scaler, test_rf = train_random_forest(df, short)
 
         # 4. MA baseline
-        test_ma = moving_average_baseline(df)
+        if CONFIG["use_walk_forward"]:
+            test_ma = test_rf.copy()
+            test_ma["signal"] = (test_ma["SMA_20"] > test_ma["SMA_50"]).astype(int)
+        else:
+            test_ma = moving_average_baseline(df)
 
         # 5. Backtest both
         res_rf = backtest(test_rf, f"{short} — Random Forest")
         res_ma = backtest(test_ma, f"{short} — MA Crossover")
-        all_results.extend([res_rf, res_ma])
+        res_bh = buy_and_hold_benchmark(test_rf, f"{short} — Buy & Hold")
+        all_results.extend([res_rf, res_ma, res_bh])
+
+        if CONFIG["paper_trading_mode"]:
+            paper_trade_cycle(df, symbol, rf, scaler)
 
         # Print quick summary
         print(f"\n  ┌─ RF  : Return={res_rf['total_return']:+.2f}%  "
               f"Sharpe={res_rf['sharpe']:.3f}  "
+              f"Sortino={res_rf['sortino']:.3f}  "
               f"MaxDD={res_rf['max_drawdown']:.2f}%  "
               f"Win={res_rf['win_rate']:.1f}%  Trades={res_rf['n_trades']}")
         print(f"  └─ MA  : Return={res_ma['total_return']:+.2f}%  "
               f"Sharpe={res_ma['sharpe']:.3f}  "
               f"MaxDD={res_ma['max_drawdown']:.2f}%  "
               f"Win={res_ma['win_rate']:.1f}%  Trades={res_ma['n_trades']}")
+        print(f"     BH  : Return={res_bh['total_return']:+.2f}%  "
+              f"CAGR={res_bh['cagr']:.2f}%  "
+              f"Sharpe={res_bh['sharpe']:.3f}")
 
     # 6. Report
     print(f"\n{'─'*60}")
