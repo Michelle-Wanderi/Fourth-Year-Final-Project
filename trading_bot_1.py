@@ -1,8 +1,5 @@
 #!/usr/bin/env python3
 """
-ML-Driven Cryptocurrency Trading Bot
-Author: Michelle Wangari Wanderi | SCT213-C002-0108/2022
-JKUAT — BSc Data Science Final Year Project
 
 Run:
     pip install yfinance pandas pandas-ta scikit-learn backtrader matplotlib seaborn
